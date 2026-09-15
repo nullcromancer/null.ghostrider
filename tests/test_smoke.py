@@ -255,6 +255,33 @@ class PairingV4Tests(unittest.TestCase):
         self.assertEqual("cline", entry["implementer"])
 
 
+class DispatchStdinTests(unittest.TestCase):
+    """Regression: dispatch must never inherit stdin.
+
+    codex prints "Reading additional input from stdin..." and blocks waiting for
+    EOF. When ghostrider spawns it with stdin inherited from a background or
+    detached parent whose pipe never closes, the agent waits forever: observed
+    burning 5.5 hours of wall time at 0.23s of CPU before it was killed. There is
+    no dispatch timeout, so nothing recovers it.
+    """
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("pairctl_stdin_test", PAIRCTL)
+        self.pairctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.pairctl)
+
+    def test_both_spawn_paths_close_stdin(self):
+        src = Path(PAIRCTL).read_text(encoding="utf-8")
+        start = src.index("def dispatch_once(")
+        end = src.index("def cmd_dispatch(", start)
+        body = src[start:end]
+        spawns = body.count("subprocess.Popen(command")
+        self.assertEqual(2, spawns,
+                         "expected two spawn paths (inherit and log); update this test")
+        self.assertEqual(spawns, body.count("stdin=subprocess.DEVNULL"),
+                         "every dispatch spawn must pass stdin=subprocess.DEVNULL")
+
+
 class LaunchCommandResolutionTests(unittest.TestCase):
     """Regression: dispatch must survive Windows PATHEXT shims.
 

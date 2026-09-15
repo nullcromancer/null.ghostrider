@@ -1069,13 +1069,18 @@ def dispatch_once(repo: Path, brief_id: str, cfg: Dict[str, object], console: Co
     out_mode = str(cfg.get("dispatch_output") or "log")
     log_path = log_dir(main, entry["id"]) / ("dispatch-R%s-%s.log" % (entry.get("round", 0), agent))
     if out_mode == "inherit":
-        proc = subprocess.Popen(command, text=True, encoding="utf-8", errors="replace")
+        # stdin MUST be closed. The prompt is passed as argv; codex additionally offers
+        # to read "additional input from stdin" and blocks forever waiting for EOF when
+        # stdin is an inherited pipe that never closes, which silently wedges the round.
+        proc = subprocess.Popen(command, text=True, encoding="utf-8", errors="replace",
+                                stdin=subprocess.DEVNULL)
         update_dispatch_process(main, str(entry["id"]), proc.pid, dispatch_id, agent)
         code = proc.wait()
     else:
         with open(log_path, "w", encoding="utf-8", newline="\n") as fh:
             proc = subprocess.Popen(command, text=True, stdout=fh, stderr=subprocess.STDOUT,
-                                    encoding="utf-8", errors="replace")
+                                    encoding="utf-8", errors="replace",
+                                    stdin=subprocess.DEVNULL)
             update_dispatch_process(main, str(entry["id"]), proc.pid, dispatch_id, agent)
             code = proc.wait()
         console.step("%s output -> %s" % (agent, log_path))
