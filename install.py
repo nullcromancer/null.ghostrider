@@ -9,10 +9,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+def _force_remove(path: Path) -> None:
+    """Remove a tree even when it contains read-only files.
+
+    Git marks objects in .git/objects read-only. On Windows os.unlink refuses
+    those with WinError 5, so a plain shutil.rmtree aborts the install halfway
+    and leaves some targets on the old version.
+    """
+    def on_error(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=lambda f, t, e: on_error(f, t, e))
+    else:
+        shutil.rmtree(path, onerror=lambda f, t, e: on_error(f, t, e))
 
 SKILL_NAME = "ghostrider"
 SOURCE = Path(__file__).resolve().parent
@@ -32,19 +53,19 @@ def copytree_atomicish(source: Path, destination: Path, force: bool, dry_run: bo
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.with_name(destination.name + ".installing")
     if staging.exists():
-        shutil.rmtree(staging)
+        _force_remove(staging)
     shutil.copytree(source, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
     if destination.exists():
         backup = destination.with_name(destination.name + ".previous")
         if backup.exists():
-            shutil.rmtree(backup)
+            _force_remove(backup)
         destination.rename(backup)
         try:
             staging.rename(destination)
         except Exception:
             backup.rename(destination)
             raise
-        shutil.rmtree(backup)
+        _force_remove(backup)
     else:
         staging.rename(destination)
 
@@ -132,7 +153,7 @@ def uninstall(destinations: List[Tuple[str, Path]], dry_run: bool) -> int:
             continue
         print("  %-7s remove -> %s" % (label, dest))
         if not dry_run:
-            shutil.rmtree(dest)
+            _force_remove(dest)
         removed += 1
     print("\n  removed %d skill installation(s)" % removed)
     print("  shared pairing config and repository queue history were left intact")
