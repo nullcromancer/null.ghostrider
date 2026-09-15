@@ -974,12 +974,21 @@ def _dispatch_prompt(repo: Path, entry: Dict[str, object], pairctl: Path, agent:
               ctl=str(pairctl.resolve()), repo=str(repo))
 
 
-def build_dispatch_command(agent: str, cfg: Dict[str, object], wt: Path, prompt: str) -> List[str]:
+def build_dispatch_command(agent: str, cfg: Dict[str, object], wt: Path, prompt: str, main: Optional[Path] = None) -> List[str]:
     command_name = implementer_command_name(agent, cfg)
     if agent == "codex":
         sandbox = str(cfg.get("codex_sandbox") or "workspace-write")
         extra = list(cfg.get("codex_extra_args") or [])
-        return [command_name, "exec", "--sandbox", sandbox, "-C", str(wt)] + extra + [prompt]
+        # A linked worktree keeps HEAD, index, objects and refs in the MAIN repository's
+        # .git directory, which sits outside the sandboxed worktree. Without write access
+        # there the agent can edit files but cannot commit, and the round is lost.
+        writable: List[str] = []
+        if main is not None:
+            git_dir = Path(main) / ".git"
+            if git_dir.exists() and Path(wt).resolve() != Path(main).resolve():
+                writable = ["--add-dir", str(git_dir)]
+        return ([command_name, "exec", "--sandbox", sandbox, "-C", str(wt)]
+                + writable + extra + [prompt])
     if agent == "cline":
         thinking = str(cfg.get("cline_thinking") or "medium")
         extra = list(cfg.get("cline_extra_args") or [])
@@ -1053,7 +1062,7 @@ def dispatch_once(repo: Path, brief_id: str, cfg: Dict[str, object], console: Co
         raise PairingError("#%s is %s; only ready/claimed can dispatch" % (entry["id"], entry["state"]))
 
     prompt = _dispatch_prompt(main, entry, Path(__file__), agent)
-    command = build_dispatch_command(agent, cfg, wt, prompt)
+    command = build_dispatch_command(agent, cfg, wt, prompt, main)
     command = resolve_launch_command(command)
     console.say("  dispatch #%s R%s -> %s [%s]" % (entry["id"], entry.get("round", 0), wt, agent))
     dispatch_id = str((entry.get("claim") or {}).get("dispatch_id") or uuid.uuid4())
