@@ -761,13 +761,19 @@ def run_verification(repo: Path, entry: Optional[Dict[str, object]], cfg: Dict[s
         console.step("verify: %s" % command)
         started = datetime.now(timezone.utc)
         try:
-            proc = subprocess.run(command_parts(command), cwd=str(repo), capture_output=True, text=True,
+            proc = subprocess.run(resolve_launch_command(command_parts(command)), cwd=str(repo),
+                                  capture_output=True, text=True,
                                   encoding="utf-8", errors="replace", timeout=timeout)
             output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
             code = proc.returncode
         except subprocess.TimeoutExpired as exc:
             output = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + "\nTIMEOUT"
             code = 124
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+            # A verification tool that is absent or unlaunchable is a failed gate, not a
+            # crash of the runtime. Record it so the round reports instead of aborting.
+            output = "verification command could not be launched: %s" % exc
+            code = 127
         duration = round((datetime.now(timezone.utc) - started).total_seconds(), 3)
         digest = hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()[:16]
         path = log_dir(common_repo_root(repo), bid) / ("%s-%02d.log" % (datetime.now().strftime("%Y%m%d-%H%M%S"), idx))
@@ -953,14 +959,19 @@ def _dispatch_prompt(repo: Path, entry: Dict[str, object], pairctl: Path, agent:
         "cline": "Use the ghostrider skill.",
         "copilot": "/ghostrider",
     }[agent]
-    return (
-        "{invoke}\n"
-        "CVM1 implement I#{id} R{round} seat={agent}.\n"
-        "CTX|python \"{ctl}\" show {id} --wire --repo \"{repo}\"\n"
-        "RULE|read repo instructions; edit only scope; commit; test; never merge.\n"
-        "OUT|report compactly with pairctl report --spec --seat {agent}.\n"
-    ).format(invoke=invoke, id=entry["id"], round=entry.get("round", 0), agent=agent,
-             ctl=str(pairctl.resolve()), repo=str(repo))
+    # Single line, deliberately. On Windows the implementer CLIs are npm .CMD shims
+    # (codex.CMD, cline.CMD) and cmd.exe truncates a multi-line argv element at the
+    # first newline, so a multi-line prompt reached the agent as just "$ghostrider"
+    # with the brief pointer silently dropped. One line on every platform keeps the
+    # dispatched prompt identical everywhere.
+    return " :: ".join([
+        invoke,
+        "CVM1 implement I#{id} R{round} seat={agent}.",
+        "CTX|python \"{ctl}\" show {id} --wire --repo \"{repo}\"",
+        "RULE|read repo instructions; edit only scope; commit; test; never merge.",
+        "OUT|report compactly with pairctl report --spec --seat {agent}.",
+    ]).format(invoke=invoke, id=entry["id"], round=entry.get("round", 0), agent=agent,
+              ctl=str(pairctl.resolve()), repo=str(repo))
 
 
 def build_dispatch_command(agent: str, cfg: Dict[str, object], wt: Path, prompt: str) -> List[str]:
@@ -986,6 +997,20 @@ def build_dispatch_command(agent: str, cfg: Dict[str, object], wt: Path, prompt:
             cmd.append("--yolo")
         return cmd + extra
     raise PairingError("unsupported implementer %s" % agent)
+
+
+def resolve_launch_command(command: List[str]) -> List[str]:
+    """Resolve argv[0] to a concrete path before spawning.
+
+    Windows CreateProcess does not consult PATHEXT, so a bare name such as
+    "codex" fails with FileNotFoundError even though shutil.which resolves it
+    to codex.CMD. npm-installed CLIs (codex, cline) are always .CMD shims, so
+    without this every dispatch on Windows dies before the agent starts.
+    """
+    if not command:
+        return command
+    resolved = shutil.which(command[0])
+    return [resolved] + list(command[1:]) if resolved else command
 
 
 def update_dispatch_process(repo: Path, brief_id: str, pid: int, dispatch_id: str, seat: str) -> None:
@@ -1029,6 +1054,7 @@ def dispatch_once(repo: Path, brief_id: str, cfg: Dict[str, object], console: Co
 
     prompt = _dispatch_prompt(main, entry, Path(__file__), agent)
     command = build_dispatch_command(agent, cfg, wt, prompt)
+    command = resolve_launch_command(command)
     console.say("  dispatch #%s R%s -> %s [%s]" % (entry["id"], entry.get("round", 0), wt, agent))
     dispatch_id = str((entry.get("claim") or {}).get("dispatch_id") or uuid.uuid4())
     out_mode = str(cfg.get("dispatch_output") or "log")

@@ -2,6 +2,8 @@
 """End-to-end standard-library smoke tests for ghostrider v4."""
 
 import json
+import shutil
+import importlib.util
 import os
 import stat
 import subprocess
@@ -90,6 +92,13 @@ class PairingV4Tests(unittest.TestCase):
             p.mkdir()
         self.env = dict(os.environ)
         self.env["HOME"] = str(self.home)
+        # Path.home() reads USERPROFILE (then HOMEDRIVE+HOMEPATH) on Windows, not HOME.
+        # Without these the install tests target the real user profile and can clobber a
+        # developer's installed skill.
+        self.env["USERPROFILE"] = str(self.home)
+        drive, tail = os.path.splitdrive(str(self.home))
+        self.env["HOMEDRIVE"] = drive or ""
+        self.env["HOMEPATH"] = tail or str(self.home)
         self.env["PAIRING_HOME"] = str(self.pairing_home)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
         self.env["COPILOT_HOME"] = str(self.home / ".copilot")
@@ -98,14 +107,36 @@ class PairingV4Tests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Smoke"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "smoke@example.invalid"], check=True)
         (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
-        (self.repo / "Makefile").write_text("test:\n\tgrep -q paired base.txt\n", encoding="utf-8")
+        (self.repo / "verify.py").write_text(
+            "import pathlib, sys\n"
+            "sys.exit(0 if \'paired\' in pathlib.Path(\'base.txt\').read_text() else 1)\n",
+            encoding="utf-8",
+        )
+        # Declare verification explicitly rather than relying on Makefile autodetection:
+        # make is not present on Windows, so the autodetected gate never ran there.
+        (self.repo / ".pairing.json").write_text(
+            json.dumps({"verification": {"commands": ["%s verify.py" % sys.executable]}}),
+            encoding="utf-8",
+        )
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "base"], check=True)
 
         for name in ("codex", "cline", "copilot"):
-            exe = self.bin / ((name + ".exe") if os.name == "nt" else name)
-            exe.write_text(FAKE_AGENT, encoding="utf-8")
-            if os.name != "nt":
+            if os.name == "nt":
+                # Windows cannot execute a text file named *.exe. Real codex/cline are
+                # npm .CMD shims, so mirror that: a .py payload plus a .CMD launcher.
+                script = self.bin / (name + ".py")
+                script.write_text(FAKE_AGENT, encoding="utf-8")
+                shim = self.bin / (name + ".CMD")
+                shim.write_text(
+                    "@echo off" + chr(13) + chr(10)
+                    + chr(34) + sys.executable + chr(34)
+                    + " " + chr(34) + "%~dp0" + name + ".py" + chr(34) + " %*" + chr(13) + chr(10),
+                    encoding="utf-8",
+                )
+            else:
+                exe = self.bin / name
+                exe.write_text(FAKE_AGENT, encoding="utf-8")
                 exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
 
     def tearDown(self):
@@ -117,9 +148,9 @@ class PairingV4Tests(unittest.TestCase):
             "goal": "make base.txt contain paired",
             "scope": ["base.txt only"],
             "constraints": ["preserve existing base line"],
-            "acceptance": ["make test passes"],
-            "files": ["base.txt", "Makefile:test"],
-            "tests": ["make test"],
+            "acceptance": ["python verify.py passes"],
+            "files": ["base.txt", "verify.py"],
+            "tests": ["python verify.py"],
             "exclude": ["no unrelated files"],
             "unknowns": [],
         }), encoding="utf-8")
@@ -222,6 +253,59 @@ class PairingV4Tests(unittest.TestCase):
         self.assertIn("[cline]", proc.stdout)
         entry = json.loads(run([PAIRCTL, "show", "1", "--json", "--repo", self.repo], env=self.env).stdout)
         self.assertEqual("cline", entry["implementer"])
+
+
+class LaunchCommandResolutionTests(unittest.TestCase):
+    """Regression: dispatch must survive Windows PATHEXT shims.
+
+    shutil.which() resolves a bare "codex" to codex.CMD, but CreateProcess does
+    not consult PATHEXT, so subprocess.Popen(["codex", ...]) raises
+    FileNotFoundError [WinError 2] and every dispatch dies before the agent runs.
+    """
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("pairctl_under_test", PAIRCTL)
+        self.pairctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.pairctl)
+        self.bindir = Path(tempfile.mkdtemp(prefix="ghostrider-bin-"))
+        self.addCleanup(shutil.rmtree, self.bindir, True)
+
+    def _make_tool(self, name):
+        if os.name == "nt":
+            tool = self.bindir / (name + ".CMD")
+            tool.write_text("@echo off\necho ok\n", encoding="utf-8")
+        else:
+            tool = self.bindir / name
+            tool.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+        return tool
+
+    def test_bare_name_resolves_to_concrete_path(self):
+        self._make_tool("faketool")
+        original = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(self.bindir) + os.pathsep + original
+        self.addCleanup(os.environ.__setitem__, "PATH", original)
+
+        resolved = self.pairctl.resolve_launch_command(["faketool", "exec", "--flag"])
+        self.assertNotEqual("faketool", resolved[0], "argv[0] was left as a bare name")
+        self.assertTrue(Path(resolved[0]).is_file())
+        self.assertEqual(["exec", "--flag"], resolved[1:], "arguments must be preserved")
+
+    def test_resolved_command_is_actually_launchable(self):
+        self._make_tool("faketool")
+        original = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(self.bindir) + os.pathsep + original
+        self.addCleanup(os.environ.__setitem__, "PATH", original)
+
+        resolved = self.pairctl.resolve_launch_command(["faketool"])
+        proc = subprocess.Popen(resolved, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc.communicate()
+        self.assertEqual(0, proc.returncode)
+
+    def test_unresolvable_and_empty_commands_pass_through(self):
+        missing = ["ghostrider-no-such-tool-xyz", "--flag"]
+        self.assertEqual(missing, self.pairctl.resolve_launch_command(list(missing)))
+        self.assertEqual([], self.pairctl.resolve_launch_command([]))
 
 
 if __name__ == "__main__":
